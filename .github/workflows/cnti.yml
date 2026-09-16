@@ -1,0 +1,80 @@
+name: CNTi certification
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"   # nightly; a full free5GC cert run takes ~1.5 h
+  push:
+    branches: [main]
+    paths: [cnti-testsuite.yaml, free5gc-helm, .github/workflows/cnti.yml]
+
+permissions:
+  contents: write   # the action publishes the badge to the 'badges' branch
+
+concurrency:
+  group: cnti-certification
+  cancel-in-progress: false
+
+jobs:
+  cert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # The free5GC UPF needs the gtp5g kernel module on the node; kind nodes share
+      # the runner's kernel, so building and loading it on the runner is enough.
+      - name: gtp5g kernel module
+        env:
+          GTP5G_VERSION: v0.10.2
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "linux-headers-$(uname -r)" build-essential libmnl-dev libyaml-dev
+          git clone --depth 1 --branch "$GTP5G_VERSION" https://github.com/free5gc/gtp5g.git /tmp/gtp5g
+          make -C /tmp/gtp5g -j"$(nproc)"
+          sudo make -C /tmp/gtp5g install
+          sudo modprobe gtp5g
+          lsmod | grep -q '^gtp5g' && echo "gtp5g $GTP5G_VERSION loaded on kernel $(uname -r)"
+
+      # Optional: ~16 images come from Docker Hub; authenticated pulls avoid the
+      # anonymous rate limit. Skipped when the secrets are not set.
+      - name: Log in to Docker Hub
+        if: env.DOCKERHUB_USERNAME != '' && env.DOCKERHUB_TOKEN != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ env.DOCKERHUB_USERNAME }}
+          password: ${{ env.DOCKERHUB_TOKEN }}
+
+      # Three nodes with the unsafe sysctls the UPF needs; the Docker credentials
+      # are mounted into the nodes only when a login happened.
+      - name: Write kind config
+        run: |
+          set -euo pipefail
+          mounts=""
+          if [[ -f "$HOME/.docker/config.json" ]]; then
+            mounts=$'    extraMounts:\n      - containerPath: /var/lib/kubelet/config.json\n        hostPath: '"$HOME"$'/.docker/config.json'
+          fi
+          node() {
+            printf '  - role: %s\n    kubeadmConfigPatches:\n      - |\n        kind: KubeletConfiguration\n        allowedUnsafeSysctls:\n          - "net.ipv4.ip_forward"\n          - "net.ipv4.conf.all.forwarding"\n' "$1"
+            [[ -n "$mounts" ]] && printf '%s\n' "$mounts"
+          }
+          {
+            printf 'kind: Cluster\napiVersion: kind.x-k8s.io/v1alpha4\nnodes:\n'
+            node control-plane; node worker; node worker
+          } > kind.yaml
+          cat kind.yaml
+
+      - name: Run CNTi Test Suite
+        # TODO: switch to lfn-cnti/testsuite-action@v1 once v1.0.0 is tagged
+        uses: lfn-cnti/testsuite-action@action-v1
+        with:
+          cnf_config: cnti-testsuite.yaml
+          kind_config: kind.yaml
+          install_timeout: 1800
+          badge_branch: badges
